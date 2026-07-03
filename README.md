@@ -1,7 +1,7 @@
 # SmartMirror
 A standalone, low-power fitness monitoring system built on a **Raspberry Pi Zero 2 W** (ARM Cortex-A53) that analyzes exercise form in real-time.
 
-## Hardware Components:-
+## Hardware Components
 - Raspberry Pi Zero 2 W (512MB RAM limit)
 -Arducam OV5647 5MP Sensor (connected via MIPI CSI-2 bus)
 - 5" LCD Panel (connected via GPIO/HDMI interface)
