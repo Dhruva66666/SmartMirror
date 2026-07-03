@@ -1,0 +1,108 @@
+import cv2
+import sys
+import time
+import numpy as np
+import urllib.request
+import os
+
+MIRROR_PORT = 8080
+WINDOW = "Smart Mirror"
+RECONNECT_DELAY = 3
+
+
+def get_screen_resolution(default_w=800, default_h=480):
+    """
+    Reads the actual physical framebuffer resolution of the Raspberry Pi.
+    If the HDMI screen is tricking the Pi into outputting 1080p, this will catch it
+    so we can stretch the image to cover the entire physical screen!
+    """
+    try:
+        with open("/sys/class/graphics/fb0/virtual_size", "r") as f:
+            w, h = map(int, f.read().strip().split(','))
+            print(f"[DISPLAY] Detected framebuffer resolution: {w}x{h}")
+            return w, h
+    except Exception as e:
+        print(f"[DISPLAY] Could not read fb0 size ({e}), defaulting to {default_w}x{default_h}")
+        return default_w, default_h
+
+
+def status_screen(msg, w, h, sub="", color=(0, 180, 255)):
+    screen = np.zeros((h, w, 3), dtype=np.uint8)
+    f = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(msg, f, 0.8, 2)
+    cv2.putText(screen, msg, ((w - tw) // 2, h // 2), f, 0.8, color, 2, cv2.LINE_AA)
+    if sub:
+        (sw, _), _ = cv2.getTextSize(sub, f, 0.45, 1)
+        cv2.putText(screen, sub, ((w - sw) // 2, h // 2 + 40), f, 0.45, (128, 128, 128), 1, cv2.LINE_AA)
+    cv2.imshow(WINDOW, screen)
+    cv2.waitKey(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage:  python3 pi_display_client.py <PC_IP>")
+        sys.exit(1)
+
+    url = f"http://{sys.argv[1]}:{MIRROR_PORT}/stream"
+    print(f"[MIRROR] Target: {url}")
+
+    display_w, display_h = get_screen_resolution()
+
+    cv2.namedWindow(WINDOW, cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    bytes_data = b''
+
+    while True:
+        status_screen("Connecting...", display_w, display_h, url)
+        try:
+            stream = urllib.request.urlopen(url, timeout=5)
+            print("[OK] Connected — streaming to display (ZERO LATENCY MODE)")
+            
+            while True:
+                # Read chunks of data directly from the network socket
+                bytes_data += stream.read(8192)
+                
+                # Look for the LAST end marker (most recent frame)
+                b = bytes_data.rfind(b'\xff\xd9')
+                
+                if b != -1:
+                    # Look for the start marker immediately preceding this end marker
+                    a = bytes_data.rfind(b'\xff\xd8', 0, b)
+                    
+                    if a != -1:
+                        # Extract the exact JPEG frame
+                        jpg = bytes_data[a:b+2]
+                        
+                        # Throw away all older backed-up data so we never lag behind!
+                        bytes_data = bytes_data[b+2:]
+                    
+                    # Decode the raw JPEG to a 24-bit BGR frame
+                    frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    
+                    if frame is not None:
+                        # FIX FOR LINUXFB RED-TINT CORRUPTION:
+                        # The Pi's framebuffer natively prefers 32-bit graphics. If we give OpenCV
+                        # a 24-bit image, the Qt linuxfb backend corrupts the color channels when bit-shifting.
+                        # Converting to 32-bit BGRA fixes the display quality instantly!
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+                        
+                        # Scale to EXACTLY match the framebuffer to avoid black borders!
+                        if frame.shape[1] != display_w or frame.shape[0] != display_h:
+                            frame = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_LINEAR)
+                        
+                        cv2.imshow(WINDOW, frame)
+                        
+                    if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                        cv2.destroyAllWindows()
+                        return
+                        
+        except Exception as e:
+            print(f"[WARN] Connection lost: {e}")
+            bytes_data = b''
+            status_screen("Connection lost", display_w, display_h, f"Retry in {RECONNECT_DELAY}s...", (0, 0, 200))
+            time.sleep(RECONNECT_DELAY)
+
+
+if __name__ == "__main__":
+    main()
