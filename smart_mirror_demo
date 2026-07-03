@@ -1,0 +1,450 @@
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+import numpy as np
+import time
+import os
+from datetime import datetime
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+PI_IP = "10.76.49.178"
+PI_PORT = 5000
+STREAM_URL = f"tcp://{PI_IP}:{PI_PORT}"
+
+USE_WEBCAM = False  # Set True to test with laptop webcam
+
+# Path to the downloaded model file
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "pose_landmarker.task")
+
+WINDOW_NAME = "IoT Smart Mirror — Shoulder Rehabilitation"
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SMALL = cv2.FONT_HERSHEY_PLAIN
+
+
+# ═══════════════════════════════════════════════════════════════
+#  COLOURS (BGR)
+# ═══════════════════════════════════════════════════════════════
+
+class Colors:
+    WHITE      = (255, 255, 255)
+    BLACK      = (0, 0, 0)
+    GRAY       = (128, 128, 128)
+    DARK_GRAY  = (40, 40, 40)
+    REST       = (200, 200, 200)
+    ACTIVE     = (0, 230, 118)
+    CAUTION    = (0, 215, 255)
+    TARGET     = (255, 200, 0)
+    SKELETON   = (0, 255, 120)
+    JOINT      = (0, 140, 255)
+    ANGLE_TEXT = (255, 255, 0)
+    BAR_BG     = (60, 60, 60)
+    BAR_BORDER = (180, 180, 180)
+    HEADER_BG  = (30, 30, 30)
+    FPS_COLOR  = (0, 200, 0)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EMA SMOOTHER — First-order IIR low-pass filter
+#  H(z) = α / (1 - (1-α)·z⁻¹)    [Oppenheim, 2014]
+# ═══════════════════════════════════════════════════════════════
+
+class AngleSmoother:
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+        self.prev = None
+
+    def update(self, raw_angle):
+        if self.prev is None:
+            self.prev = raw_angle
+            return raw_angle
+        smoothed = self.alpha * raw_angle + (1 - self.alpha) * self.prev
+        self.prev = smoothed
+        return round(smoothed, 1)
+
+    def reset(self):
+        self.prev = None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ANGLE CALCULATOR — arctan2 method [Mitrović, 2023]
+# ═══════════════════════════════════════════════════════════════
+
+def calculate_angle(a, b, c):
+    """
+    Compute joint angle at vertex B from points A-B-C.
+    Returns degrees ∈ [0, 180].
+    """
+    a = np.array(a, dtype=np.float64)
+    b = np.array(b, dtype=np.float64)
+    c = np.array(c, dtype=np.float64)
+
+    alpha = np.arctan2(a[1] - b[1], a[0] - b[0])
+    beta  = np.arctan2(c[1] - b[1], c[0] - b[0])
+    delta = beta - alpha
+
+    angle = np.abs(delta) * 180.0 / np.pi
+    if angle > 180.0:
+        angle = 360.0 - angle
+    return round(angle, 1)
+
+
+def get_lm_px(landmark, w, h):
+    """Convert normalized landmark to pixel coords."""
+    return [landmark.x * w, landmark.y * h]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLINICAL STATE MACHINE [Kessel & Watson 1977, Neer 1972]
+# ═══════════════════════════════════════════════════════════════
+
+def get_shoulder_state(angle):
+    if angle < 23:
+        return "REST", Colors.REST
+    elif angle < 60:
+        return "CAUTION", Colors.CAUTION
+    elif angle < 120:
+        return "ACTIVE", Colors.ACTIVE
+    else:
+        return "TARGET", Colors.TARGET
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DRAWING UTILITIES
+# ═══════════════════════════════════════════════════════════════
+
+def draw_angle_arc(frame, center, angle, radius=35, color=Colors.ANGLE_TEXT):
+    cx, cy = int(center[0]), int(center[1])
+    start_angle = -int(angle / 2)
+    end_angle = int(angle / 2)
+    cv2.ellipse(frame, (cx, cy), (radius, radius),
+                0, start_angle, end_angle, color, 2)
+
+
+def draw_angle_label(frame, text, pos, color=Colors.ANGLE_TEXT):
+    x, y = int(pos[0]), int(pos[1])
+    (tw, th), baseline = cv2.getTextSize(text, FONT, 0.6, 2)
+    cv2.rectangle(frame, (x - 5, y - th - 5),
+                  (x + tw + 5, y + baseline + 5), Colors.DARK_GRAY, -1)
+    cv2.rectangle(frame, (x - 5, y - th - 5),
+                  (x + tw + 5, y + baseline + 5), color, 1)
+    cv2.putText(frame, text, (x, y), FONT, 0.6, color, 2, cv2.LINE_AA)
+
+
+def draw_progress_bar(frame, angle, x, y, w_bar, h_bar, label="Shoulder"):
+    cv2.rectangle(frame, (x, y), (x + w_bar, y + h_bar), Colors.BAR_BG, -1)
+    cv2.rectangle(frame, (x, y), (x + w_bar, y + h_bar), Colors.BAR_BORDER, 2)
+
+    fill_ratio = np.clip(angle / 180.0, 0.0, 1.0)
+    fill_height = int(h_bar * fill_ratio)
+    fill_top = y + h_bar - fill_height
+
+    state_name, state_color = get_shoulder_state(angle)
+    cv2.rectangle(frame, (x + 2, fill_top), (x + w_bar - 2, y + h_bar - 2),
+                  state_color, -1)
+
+    cv2.putText(frame, f"{int(angle)}deg", (x - 5, y + h_bar + 22),
+                FONT, 0.5, Colors.WHITE, 1, cv2.LINE_AA)
+    cv2.putText(frame, label, (x - 5, y - 8),
+                FONT_SMALL, 1.0, Colors.WHITE, 1, cv2.LINE_AA)
+    cv2.putText(frame, state_name, (x - 5, y + h_bar + 42),
+                FONT_SMALL, 1.0, state_color, 1, cv2.LINE_AA)
+
+
+def draw_header(frame, fps, mode_name, recording=False):
+    h, w = frame.shape[:2]
+    cv2.rectangle(frame, (0, 0), (w, 45), Colors.HEADER_BG, -1)
+    cv2.putText(frame, "IoT Smart Mirror", (10, 30),
+                FONT, 0.7, Colors.WHITE, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"FPS: {fps:.0f}", (w - 120, 30),
+                FONT, 0.6, Colors.FPS_COLOR, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"[{mode_name}]", (w - 280, 30),
+                FONT, 0.5, Colors.GRAY, 1, cv2.LINE_AA)
+    if recording:
+        cv2.circle(frame, (w - 140, 22), 8, (0, 0, 255), -1)
+        cv2.putText(frame, "REC", (w - 128, 28),
+                    FONT_SMALL, 1.0, (0, 0, 255), 1, cv2.LINE_AA)
+
+
+def draw_info_panel(frame, angles_data, y_start=60):
+    h, w = frame.shape[:2]
+    panel_w = 220
+    panel_h = len(angles_data) * 35 + 20
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (w - panel_w - 10, y_start),
+                  (w - 10, y_start + panel_h), Colors.DARK_GRAY, -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    cv2.rectangle(frame, (w - panel_w - 10, y_start),
+                  (w - 10, y_start + panel_h), Colors.GRAY, 1)
+
+    cv2.putText(frame, "Joint Angles", (w - panel_w, y_start + 18),
+                FONT_SMALL, 1.2, Colors.WHITE, 1, cv2.LINE_AA)
+
+    for i, (name, angle, vis) in enumerate(angles_data):
+        yy = y_start + 40 + i * 35
+        vis_color = Colors.ACTIVE if vis > 0.5 else (0, 0, 200)
+        cv2.circle(frame, (w - panel_w, yy - 4), 4, vis_color, -1)
+        cv2.putText(frame, f"{name}:", (w - panel_w + 12, yy),
+                    FONT_SMALL, 1.0, Colors.WHITE, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{angle:.1f} deg", (w - 85, yy),
+                    FONT, 0.5, Colors.ANGLE_TEXT, 1, cv2.LINE_AA)
+
+
+# Upper body skeleton connections
+UPPER_BODY_CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24),
+]
+
+def draw_custom_skeleton(frame, landmarks, w, h):
+    for (si, ei) in UPPER_BODY_CONNECTIONS:
+        s = landmarks[si]
+        e = landmarks[ei]
+        if s.visibility < 0.5 or e.visibility < 0.5:
+            continue
+        pt1 = (int(s.x * w), int(s.y * h))
+        pt2 = (int(e.x * w), int(e.y * h))
+        cv2.line(frame, pt1, pt2, Colors.SKELETON, 2, cv2.LINE_AA)
+
+    for idx in [11, 12, 13, 14, 15, 16, 23, 24]:
+        lm = landmarks[idx]
+        if lm.visibility < 0.5:
+            continue
+        pt = (int(lm.x * w), int(lm.y * h))
+        cv2.circle(frame, pt, 6, Colors.JOINT, -1)
+        cv2.circle(frame, pt, 6, Colors.WHITE, 1)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 60)
+    print("  IoT Smart Mirror — Pose Estimation Demo")
+    print("=" * 60)
+
+    # ── Check model file exists ──
+    if not os.path.exists(MODEL_PATH):
+        print(f"\n[ERROR] Model file not found at: {MODEL_PATH}")
+        print("Download it with:")
+        print('  Invoke-WebRequest -Uri "https://storage.googleapis.com/mediapipe-models/'
+              'pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"'
+              f' -OutFile "{MODEL_PATH}"')
+        return
+
+    print(f"[OK] Model file found: {os.path.basename(MODEL_PATH)}")
+
+    # ── Initialize stream ──
+    if USE_WEBCAM:
+        print("\n[INFO] Using WEBCAM for testing...")
+        cap = cv2.VideoCapture(0)
+    else:
+        print(f"\n[INFO] Connecting to Pi stream at {STREAM_URL}")
+        print("[INFO] Make sure rpicam-vid is running on the Pi!")
+        cap = cv2.VideoCapture(STREAM_URL)
+
+    if not cap.isOpened():
+        print("\n[ERROR] Cannot open video stream!")
+        if not USE_WEBCAM:
+            print(f"  -> Is the Pi streaming at {STREAM_URL}?")
+            print(f"  -> Or set USE_WEBCAM = True to test with laptop camera.")
+        return
+
+    print("[OK] Stream connected!\n")
+
+    # ── Initialize MediaPipe PoseLandmarker (new Tasks API) ──
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+
+    print("[OK] MediaPipe PoseLandmarker initialized.\n")
+
+    # ── Smoothers ──
+    smoothers = {
+        'l_shoulder': AngleSmoother(alpha=0.3),
+        'r_shoulder': AngleSmoother(alpha=0.3),
+        'l_elbow':    AngleSmoother(alpha=0.3),
+        'r_elbow':    AngleSmoother(alpha=0.3),
+    }
+
+    # ── State ──
+    display_modes = ["Full", "Angles", "Skeleton", "Clean"]
+    mode_idx = 0
+    recording = False
+    video_writer = None
+    frame_count = 0
+    fps = 0.0
+    prev_time = time.perf_counter()
+    timestamp_ms = 0
+
+    print("Controls:  Q=Quit  S=Screenshot  R=Record  M=Mode")
+    print()
+
+    # ── Main loop ──
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[WARN] Frame grab failed, retrying...")
+            time.sleep(0.1)
+            continue
+
+        h, w, _ = frame.shape
+        current_mode = display_modes[mode_idx]
+
+        # FPS
+        frame_count += 1
+        now = time.perf_counter()
+        dt = now - prev_time
+        if dt > 0:
+            fps = 0.9 * fps + 0.1 * (1.0 / dt)
+        prev_time = now
+
+        # ── MediaPipe inference (new Tasks API) ──
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
+        timestamp_ms += 33  # ~30fps increment
+        results = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        # ── Process landmarks ──
+        if results.pose_landmarks and len(results.pose_landmarks) > 0:
+            lm = results.pose_landmarks[0]  # First person
+
+            # Extract pixel coordinates
+            l_hip      = get_lm_px(lm[23], w, h)
+            r_hip      = get_lm_px(lm[24], w, h)
+            l_shoulder = get_lm_px(lm[11], w, h)
+            r_shoulder = get_lm_px(lm[12], w, h)
+            l_elbow    = get_lm_px(lm[13], w, h)
+            r_elbow    = get_lm_px(lm[14], w, h)
+            l_wrist    = get_lm_px(lm[15], w, h)
+            r_wrist    = get_lm_px(lm[16], w, h)
+
+            # Compute raw angles (Eq. 16–20)
+            l_sh_raw = calculate_angle(l_hip, l_shoulder, l_elbow)
+            r_sh_raw = calculate_angle(r_hip, r_shoulder, r_elbow)
+            l_el_raw = calculate_angle(l_shoulder, l_elbow, l_wrist)
+            r_el_raw = calculate_angle(r_shoulder, r_elbow, r_wrist)
+
+            # EMA smoothing (Eq. 25)
+            l_sh = smoothers['l_shoulder'].update(l_sh_raw)
+            r_sh = smoothers['r_shoulder'].update(r_sh_raw)
+            l_el = smoothers['l_elbow'].update(l_el_raw)
+            r_el = smoothers['r_elbow'].update(r_el_raw)
+
+            # Draw skeleton
+            if current_mode in ["Full", "Skeleton"]:
+                draw_custom_skeleton(frame, lm, w, h)
+
+            # Draw angle labels
+            if current_mode in ["Full", "Angles"]:
+                if lm[11].visibility > 0.5:
+                    draw_angle_label(frame, f"{l_sh:.0f} deg",
+                                     [l_shoulder[0] - 70, l_shoulder[1] - 15])
+                    draw_angle_arc(frame, l_shoulder, l_sh)
+
+                if lm[12].visibility > 0.5:
+                    draw_angle_label(frame, f"{r_sh:.0f} deg",
+                                     [r_shoulder[0] + 15, r_shoulder[1] - 15])
+                    draw_angle_arc(frame, r_shoulder, r_sh)
+
+                if lm[13].visibility > 0.5:
+                    draw_angle_label(frame, f"{l_el:.0f} deg",
+                                     [l_elbow[0] - 70, l_elbow[1] - 15],
+                                     (180, 255, 180))
+
+                if lm[14].visibility > 0.5:
+                    draw_angle_label(frame, f"{r_el:.0f} deg",
+                                     [r_elbow[0] + 15, r_elbow[1] - 15],
+                                     (180, 255, 180))
+
+            # Progress bars
+            if current_mode in ["Full", "Angles"]:
+                draw_progress_bar(frame, l_sh, x=20, y=70, w_bar=30, h_bar=180,
+                                  label="L Shoulder")
+                draw_progress_bar(frame, r_sh, x=70, y=70, w_bar=30, h_bar=180,
+                                  label="R Shoulder")
+
+            # Info panel
+            if current_mode == "Full":
+                angles_data = [
+                    ("L Shoulder", l_sh, lm[11].visibility),
+                    ("R Shoulder", r_sh, lm[12].visibility),
+                    ("L Elbow",    l_el, lm[13].visibility),
+                    ("R Elbow",    r_el, lm[14].visibility),
+                ]
+                draw_info_panel(frame, angles_data)
+
+            # Console output every 30 frames
+            if frame_count % 30 == 0:
+                state_name, _ = get_shoulder_state(l_sh)
+                print(f"  L_Shoulder: {l_sh:6.1f} [{state_name:8s}]  "
+                      f"R_Shoulder: {r_sh:6.1f}  "
+                      f"L_Elbow: {l_el:6.1f}  "
+                      f"R_Elbow: {r_el:6.1f}  "
+                      f"FPS: {fps:.0f}")
+        else:
+            cv2.putText(frame, "No person detected", (w // 2 - 130, h // 2),
+                        FONT, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+            for s in smoothers.values():
+                s.reset()
+
+        # Header
+        draw_header(frame, fps, current_mode, recording)
+
+        # Recording
+        if recording and video_writer is not None:
+            video_writer.write(frame)
+
+        # Display
+        cv2.imshow(WINDOW_NAME, frame)
+
+        # Key handling
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            break
+        elif key == ord('s') or key == ord('S'):
+            fn = f"screenshot_{datetime.now().strftime('%H-%M-%S')}.jpg"
+            cv2.imwrite(fn, frame)
+            print(f"  [SCREENSHOT] Saved: {fn}")
+        elif key == ord('r') or key == ord('R'):
+            if not recording:
+                vn = f"recording_{datetime.now().strftime('%H-%M-%S')}.mp4"
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(vn, fourcc, 20.0, (w, h))
+                recording = True
+                print(f"  [REC] Started: {vn}")
+            else:
+                recording = False
+                if video_writer:
+                    video_writer.release()
+                    video_writer = None
+                print("  [REC] Stopped.")
+        elif key == ord('m') or key == ord('M'):
+            mode_idx = (mode_idx + 1) % len(display_modes)
+            print(f"  [MODE] {display_modes[mode_idx]}")
+
+    # Cleanup
+    print("\n[INFO] Shutting down...")
+    if recording and video_writer:
+        video_writer.release()
+    cap.release()
+    landmarker.close()
+    cv2.destroyAllWindows()
+    print("[OK] Done.")
+
+
+if __name__ == "__main__":
+    main()
